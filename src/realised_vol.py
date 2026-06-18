@@ -17,6 +17,7 @@ TRADING_DAYS_PER_YEAR = 252
 DEFAULT_ROLLING_WINDOWS = [10, 21, 63]   # ~2-week, 1-month, 1-quarter
 DEFAULT_TRAIN_WINDOW = 252               # rolling GARCH train window (1 year)
 DEFAULT_PERIOD = "5y"                    # yfinance period string
+DEFAULT_TERM_HORIZONS = [21, 63, 126]    # ~1mo, ~3mo, ~6mo trading days
 
 
 # ── Data fetching ─────────────────────────────────────────────────────────────
@@ -204,6 +205,95 @@ def fit_garch(returns: pd.Series) -> dict:
 
 
 # ── Walk-forward GARCH forecast (pipeline input) ─────────────────────────────
+
+def walk_forward_garch_term_structure(
+    returns: pd.Series,
+    horizons: list[int] = DEFAULT_TERM_HORIZONS,
+    train_window: int = DEFAULT_TRAIN_WINDOW,
+) -> pd.DataFrame:
+    """
+    Produce multi-horizon annualised GARCH(1,1) vol forecasts using a
+    rolling train window. At each date t, fits once on the trailing
+    train_window and calls res.forecast(horizon=max_horizon) once, then
+    takes cumulative sums of the daily variance path to derive each
+    horizon's N-day annualised vol forecast.
+
+    No lookahead: forecast for date t uses only data up to and including t-1.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Daily log returns with DatetimeIndex.
+    horizons : list[int]
+        Forecast horizons in trading days. Default [21, 63, 126].
+    train_window : int
+        Rolling training window size. Default 252.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: f"garch_forecast_{N}d" for each N in horizons.
+        Index aligned to returns. First train_window rows are NaN.
+    """
+    try:
+        from arch import arch_model
+    except ImportError:
+        raise ImportError("arch package required: pip install arch")
+
+    if not isinstance(returns, pd.Series):
+        raise TypeError(f"returns must be a pd.Series, got {type(returns)}")
+    if not horizons:
+        raise ValueError("horizons must be a non-empty list")
+    if any(h < 1 for h in horizons):
+        raise ValueError("all horizons must be >= 1")
+    if len(returns) < train_window + 1:
+        raise ValueError(
+            f"returns length {len(returns)} must exceed train_window {train_window}"
+        )
+
+    max_horizon = max(horizons)
+    returns_pct = returns * 100
+    cols = [f"garch_forecast_{h}d" for h in horizons]
+    result = pd.DataFrame(np.nan, index=returns.index, columns=cols, dtype=float)
+    n = len(returns)
+    total_steps = n - train_window
+    log_every = max(1, total_steps // 10)
+
+    logger.info(
+        f"Starting walk-forward GARCH term structure: {total_steps} steps, "
+        f"train_window={train_window}, horizons={horizons}"
+    )
+
+    for i in range(train_window, n):
+        train_slice = returns_pct.iloc[i - train_window: i]
+        forecast_date = returns.index[i]
+
+        try:
+            am = arch_model(train_slice, vol="Garch", p=1, q=1, dist="normal", rescale=False)
+            res = am.fit(disp="off", show_warning=False)
+
+            # one call covers all horizons up to max_horizon
+            fc = res.forecast(horizon=max_horizon, reindex=False)
+            daily_vars = fc.variance.iloc[-1].values  # shape (max_horizon,), pct² units
+
+            for h in horizons:
+                # cumulative variance over h days → annualise → convert from pct to decimal
+                cum_var_pct2 = daily_vars[:h].sum()
+                result.loc[forecast_date, f"garch_forecast_{h}d"] = (
+                    np.sqrt(cum_var_pct2 * TRADING_DAYS_PER_YEAR / h) / 100
+                )
+
+        except Exception as e:
+            logger.warning(f"GARCH fit failed at {forecast_date.date()}: {e} — skipping")
+
+        if (i - train_window + 1) % log_every == 0:
+            pct_done = (i - train_window + 1) / total_steps * 100
+            logger.info(f"Walk-forward term structure progress: {pct_done:.0f}%")
+
+    valid = result.notna().all(axis=1).sum()
+    logger.info(f"Walk-forward term structure complete: {valid}/{total_steps} fully valid rows")
+    return result
+
 
 def walk_forward_garch_forecast(
     returns: pd.Series,

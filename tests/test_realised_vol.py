@@ -20,8 +20,10 @@ from src.realised_vol import (
     compute_rolling_vol,
     fit_garch,
     walk_forward_garch_forecast,
+    walk_forward_garch_term_structure,
     TRADING_DAYS_PER_YEAR,
     DEFAULT_ROLLING_WINDOWS,
+    DEFAULT_TERM_HORIZONS,
     DEFAULT_TRAIN_WINDOW,
 )
 
@@ -322,3 +324,111 @@ class TestWalkForwardGarchForecast:
     def test_raises_on_non_series(self):
         with pytest.raises(TypeError):
             walk_forward_garch_forecast(np.array([0.01] * 300))
+
+
+# ── walk_forward_garch_term_structure ─────────────────────────────────────────
+
+class TestWalkForwardGarchTermStructure:
+
+    _HORIZONS = [21, 63, 126]
+
+    @pytest.fixture(scope="class")
+    def term_df(self):
+        returns = make_returns(600)
+        return returns, walk_forward_garch_term_structure(
+            returns, horizons=self._HORIZONS, train_window=252
+        )
+
+    def test_output_is_dataframe(self, term_df):
+        _, df = term_df
+        assert isinstance(df, pd.DataFrame)
+
+    def test_output_shape(self, term_df):
+        returns, df = term_df
+        assert df.shape == (len(returns), len(self._HORIZONS))
+
+    def test_column_names(self, term_df):
+        _, df = term_df
+        expected = [f"garch_forecast_{h}d" for h in self._HORIZONS]
+        assert list(df.columns) == expected
+
+    def test_index_aligned_to_returns(self, term_df):
+        returns, df = term_df
+        assert df.index.equals(returns.index)
+
+    def test_nan_prefix(self, term_df):
+        """First train_window rows must be NaN across all columns."""
+        _, df = term_df
+        assert df.iloc[:252].isnull().all(axis=None), \
+            "Expected NaN for first 252 rows (no lookahead)"
+
+    def test_forecasts_exist_after_warmup(self, term_df):
+        _, df = term_df
+        assert df.iloc[252:].notna().all(axis=1).sum() > 0
+
+    def test_forecasts_positive(self, term_df):
+        _, df = term_df
+        valid = df.dropna()
+        assert (valid > 0).all(axis=None), "All vol forecasts should be positive"
+
+    def test_forecasts_plausible_range(self, term_df):
+        """Annualised vol forecasts should sit in (1%, 150%) for equity-like returns."""
+        _, df = term_df
+        valid = df.dropna()
+        assert (valid > 0.01).all(axis=None) and (valid < 1.5).all(axis=None), \
+            f"Implausible range: min={valid.min().min():.4f}, max={valid.max().max():.4f}"
+
+    def test_cumulative_variance_grows_with_horizon(self, term_df):
+        """
+        Cumulative variance = ann_vol^2 * h / 252 must be non-decreasing across
+        horizons for every date, because we sum non-negative daily variance terms.
+        """
+        _, df = term_df
+        valid = df.dropna()
+        for h1, h2 in zip(self._HORIZONS[:-1], self._HORIZONS[1:]):
+            cum_var_h1 = valid[f"garch_forecast_{h1}d"] ** 2 * h1 / TRADING_DAYS_PER_YEAR
+            cum_var_h2 = valid[f"garch_forecast_{h2}d"] ** 2 * h2 / TRADING_DAYS_PER_YEAR
+            assert (cum_var_h2 >= cum_var_h1 - 1e-12).all(), \
+                f"Cumulative variance decreased from h={h1} to h={h2}"
+
+    def test_no_lookahead(self):
+        """
+        Term structure forecasts on the first half of returns must match those
+        from the full series over the overlapping window.
+        """
+        returns = make_returns(600)
+        half = 400
+        horizons = [21, 63]
+
+        fc_full = walk_forward_garch_term_structure(returns, horizons=horizons, train_window=252)
+        fc_half = walk_forward_garch_term_structure(returns.iloc[:half], horizons=horizons, train_window=252)
+
+        overlap = fc_half.dropna().index
+        for col in fc_full.columns:
+            diff = (fc_full.loc[overlap, col] - fc_half.loc[overlap, col]).abs()
+            assert diff.max() < 1e-6, \
+                f"Lookahead detected in {col}: max diff={diff.max():.2e}"
+
+    def test_custom_horizons(self):
+        returns = make_returns(400)
+        df = walk_forward_garch_term_structure(returns, horizons=[10, 21], train_window=252)
+        assert list(df.columns) == ["garch_forecast_10d", "garch_forecast_21d"]
+
+    def test_raises_if_too_short(self):
+        returns = make_returns(200)
+        with pytest.raises(ValueError):
+            walk_forward_garch_term_structure(returns, train_window=252)
+
+    def test_raises_on_non_series(self):
+        with pytest.raises(TypeError):
+            walk_forward_garch_term_structure(np.array([0.01] * 400))
+
+    def test_raises_on_empty_horizons(self):
+        returns = make_returns(400)
+        with pytest.raises(ValueError):
+            walk_forward_garch_term_structure(returns, horizons=[], train_window=252)
+
+    def test_raises_on_invalid_horizon(self):
+        returns = make_returns(400)
+        with pytest.raises(ValueError):
+            walk_forward_garch_term_structure(returns, horizons=[0, 21], train_window=252)
